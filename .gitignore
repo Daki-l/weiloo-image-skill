@@ -1,26 +1,19 @@
+# Never commit credentials or local configuration.
 auth.json
-.codex/openai-compatible-imagegen/config.json
+config.json
 .env
 .env.*
 !.env.example
-!.env.sample
-!.env.template
 
-*.log
+# Generated images and local Python artifacts.
+generated/
+outputs/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
-coverage/
 
-outputs/
-generated/
-manifest.json
-node_modules/
-release/
-dist/*.zip
-docs/.internal/
-
+# Editor and operating-system files.
 .DS_Store
 Thumbs.db
 .idea/
