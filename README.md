@@ -6,7 +6,9 @@
 
 ```text
 安装这个 Skill：
-https://github.com/Daki-l/weiloo-image-skill
+https://github.com/weilooAi/weiloo-image-skill
+apiKey:
+sk-xxxx
 ```
 
 ## 配置
@@ -18,7 +20,7 @@ https://github.com/Daki-l/weiloo-image-skill
 在 Codex 中输入：
 
 ```text
-$weiloo-image 一只宇航员猫
+$weiloo-image 一只weiloo在跳舞
 ```
 
 即可生成图片。
