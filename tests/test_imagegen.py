@@ -156,6 +156,10 @@ class ImagegenTests(unittest.TestCase):
             )
             self.assertEqual(request.get_header("Authorization"), "Bearer test-api-key")
             self.assertEqual(request.get_header("Content-type"), "application/json")
+            self.assertEqual(
+                request.get_header("User-agent"),
+                "Codex-Weiloo-Image-Skill/1.0",
+            )
             self.assertEqual(written_path, output_path)
             self.assertEqual(output_path.read_bytes(), image_bytes)
 
@@ -182,6 +186,12 @@ class ImagegenTests(unittest.TestCase):
                 )
 
             self.assertEqual(urlopen.call_count, 2)
+            download_request = urlopen.call_args_list[1].args[0]
+            self.assertEqual(download_request.get_header("Accept"), "image/*")
+            self.assertEqual(
+                download_request.get_header("User-agent"),
+                "Codex-Weiloo-Image-Skill/1.0",
+            )
             self.assertEqual(output_path.read_bytes(), image_bytes)
 
     def test_save_failure_is_reported_without_a_traceback(self) -> None:
@@ -194,8 +204,27 @@ class ImagegenTests(unittest.TestCase):
 
     def test_http_and_network_failures_have_simple_chinese_messages(self) -> None:
         self.assertEqual(self.imagegen.friendly_error(401), "API Key 无效，请检查。")
+        self.assertEqual(
+            self.imagegen.friendly_error(403),
+            "图片服务拒绝该请求，请检查账户权限或稍后重试。",
+        )
         self.assertEqual(self.imagegen.friendly_error(429), "API 请求次数达到限制。")
         self.assertEqual(self.imagegen.friendly_error(None), "无法连接图片服务，请检查网络。")
+
+    def test_url_download_uses_the_same_friendly_http_error(self) -> None:
+        error = urllib.error.HTTPError(
+            "https://images.example.test/result.png",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(b'{"error":"do not show this"}'),
+        )
+
+        with mock.patch.object(self.imagegen.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(self.imagegen.ImagegenError, "图片服务拒绝") as ctx:
+                self.imagegen._download_image("https://images.example.test/result.png")
+
+        self.assertNotIn("do not show this", str(ctx.exception))
 
     def test_http_error_is_mapped_without_exposing_the_server_body(self) -> None:
         config = self.imagegen.Config(
