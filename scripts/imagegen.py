@@ -28,6 +28,7 @@ SCRIPT_DIR: Final = Path(__file__).resolve().parent
 DEFAULT_BASE_URL: Final = "https://ai.weiloo.com/v1"
 DEFAULT_MODEL: Final = "gpt-image-2.5"
 DEFAULT_SIZE: Final = "1024x1024"
+USER_AGENT: Final = "Codex-Weiloo-Image-Skill/1.0"
 REQUEST_TIMEOUT_SECONDS: Final = 120
 MAX_JSON_RESPONSE_BYTES: Final = 5 * 1024 * 1024
 MAX_IMAGE_BYTES: Final = 50 * 1024 * 1024
@@ -128,6 +129,8 @@ def friendly_error(status_code: int | None) -> str:
     """Map transport failures to the short messages promised to users."""
     if status_code == 401:
         return "API Key 无效，请检查。"
+    if status_code == 403:
+        return "图片服务拒绝该请求，请检查账户权限或稍后重试。"
     if status_code == 429:
         return "API 请求次数达到限制。"
     if status_code is None:
@@ -155,6 +158,7 @@ def build_generation_request(config: Config, prompt: str, size: str) -> urllib.r
         headers={
             "Authorization": f"Bearer {config.api_key}",
             "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
         },
     )
 
@@ -196,11 +200,19 @@ def _download_image(url: str) -> bytes:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ImagegenError("服务返回的图片地址无效，请稍后重试。")
-    request = urllib.request.Request(url, headers={"Accept": "image/*"})
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "image/*",
+            "User-Agent": USER_AGENT,
+        },
+    )
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             image = _read_limited(response, MAX_IMAGE_BYTES, "图片文件过大，请稍后重试。")
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
+    except urllib.error.HTTPError as exc:
+        raise ImagegenError(friendly_error(exc.code)) from exc
+    except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
         raise ImagegenError("图片下载失败，请检查网络连接后重试。") from exc
     if not image:
         raise ImagegenError("服务返回的图片数据无效，请稍后重试。")
