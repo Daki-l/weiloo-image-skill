@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import importlib.util
 import io
 import json
@@ -253,6 +254,39 @@ class ImagegenTests(unittest.TestCase):
                 )
 
         self.assertNotIn("do not show this", str(ctx.exception))
+
+    def test_default_output_path_uses_an_ascii_filename_in_workspace_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+
+            with mock.patch.object(self.imagegen.Path, "cwd", return_value=workspace):
+                output_path = self.imagegen.default_output_path("一张未来城市图片")
+
+        self.assertEqual(output_path.parent, workspace / "outputs")
+        self.assertTrue(output_path.name.isascii())
+        self.assertTrue(output_path.name.endswith(".png"))
+
+    def test_main_emits_a_machine_readable_success_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "outputs" / "future-city-城市.png"
+            generated_path = output_path.resolve()
+            stdout = io.StringIO()
+
+            with (
+                mock.patch.object(self.imagegen, "ensure_config"),
+                mock.patch.object(self.imagegen, "generate_image", return_value=generated_path),
+                contextlib.redirect_stdout(stdout),
+            ):
+                exit_code = self.imagegen.main(
+                    ["--prompt", "一座未来城市", "--output", str(output_path)]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            stdout.getvalue(),
+            f"IMAGE_PATH={json.dumps(str(generated_path), ensure_ascii=True)}\n",
+        )
+        self.assertTrue(stdout.getvalue().isascii())
 
 
 if __name__ == "__main__":

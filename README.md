@@ -23,4 +23,4 @@ sk-xxxx
 $weiloo-image 一只weiloo在跳舞
 ```
 
-即可生成图片。
+即可生成图片。生成后的图片会保存在当前任务的 `outputs` 文件夹中。
