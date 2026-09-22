@@ -21,4 +21,4 @@ https://github.com/Daki-l/weiloo-image-skill
 $weiloo-image 一只宇航员猫
 ```
 
-即可生成图片。
+即可生成图片。生成后的图片会保存在当前任务的 `outputs` 文件夹中。

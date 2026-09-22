@@ -310,7 +310,10 @@ def generate_image(config: Config, prompt: str, size: str, output_path: Path) ->
 
 
 def _slugify(value: str) -> str:
-    result = "".join(character if character.isalnum() else "-" for character in value.lower())
+    result = "".join(
+        character if character.isascii() and character.isalnum() else "-"
+        for character in value.lower()
+    )
     result = re.sub(r"-+", "-", result).strip("-")
     return result[:36] or "image"
 
@@ -319,7 +322,7 @@ def default_output_path(prompt: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     suffix = secrets.token_hex(3)
     filename = f"weiloo-{timestamp}-{_slugify(prompt)}-{suffix}.png"
-    return Path.cwd() / "generated" / filename
+    return Path.cwd() / "outputs" / filename
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -363,7 +366,9 @@ def main(argv: list[str] | None = None) -> int:
         print("已取消。", file=sys.stderr)
         return 130
 
-    print(f"图片已生成：{generated.resolve()}")
+    # Keep the success record ASCII-only so Codex can recover it through
+    # terminals whose display encoding does not support Chinese text.
+    print(f"IMAGE_PATH={json.dumps(str(generated.resolve()), ensure_ascii=True)}")
     return 0
 
 

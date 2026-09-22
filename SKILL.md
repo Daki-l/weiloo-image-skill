@@ -20,14 +20,17 @@ $weiloo-image 生成一张赛博朋克城市
 - 海报设计
 - 图片编辑
 
-执行 `scripts/imagegen.py` 生成图片：
+执行本 Skill 目录中的 `scripts/imagegen.py` 生成图片。命令的工作目录保持为用户当前
+任务目录，不要切换到已安装的 Skill 目录：
 
 ```bash
-python scripts/imagegen.py --prompt "<用户图片描述>"
+python "<Skill 目录>/scripts/imagegen.py" --prompt "<用户图片描述>"
 ```
 
-普通生成时直接在前台执行一次脚本。不要先读取源码、调用 `/models`、修改已安装
-Skill 文件、启动后台进程或轮询 Python 进程。
+普通生成时直接在前台执行一次脚本。默认图片保存到当前任务目录下的 `outputs/`。
+成功后读取并报告脚本输出的 `IMAGE_PATH=` 行；其值是 JSON 字符串。不要通过扫描目录
+推断图片路径。不要先读取源码、调用 `/models`、修改已安装 Skill 文件、启动后台进程
+或轮询 Python 进程。
 
 图片请求可能计费。生成失败时报告脚本的用户友好错误并停止；不要自动重试。只有用户
 明确同意后，才可以再次提交图片生成请求。成功后直接报告文件路径；除非用户要求，
