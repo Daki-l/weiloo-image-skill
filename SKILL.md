@@ -1,6 +1,6 @@
 ---
 name: weiloo-image
-description: 使用 Weiloo AI 图片 API 生成图片。
+description: 使用 Weiloo AI 图片 API 生成图片，或分析 Weiloo 图片生成失败。
 ---
 
 # Weiloo Image
@@ -19,6 +19,7 @@ $weiloo-image 生成一张赛博朋克城市
 - 创建图片
 - 海报设计
 - 图片编辑
+- 分析 Weiloo 图片生成失败
 
 执行本 Skill 目录中的 `scripts/imagegen.py` 生成图片。命令的工作目录保持为用户当前
 任务目录，不要切换到已安装的 Skill 目录：
@@ -35,6 +36,20 @@ python "<Skill 目录>/scripts/imagegen.py" --prompt "<用户图片描述>"
 图片请求可能计费。生成失败时报告脚本的用户友好错误并停止；不要自动重试。只有用户
 明确同意后，才可以再次提交图片生成请求。成功后直接报告文件路径；除非用户要求，
 不要额外检查图片画面。
+
+失败时，脚本会输出 `DIAGNOSTIC_REPORT=` 行。读取其 JSON 路径并将 Markdown 报告交付
+给用户，不要扫描目录或重复提交图片请求。
+
+只有用户明确询问“为什么生成失败”或显式输入 `$weiloo-image 为什么生成失败` 时，才在
+当前任务目录运行：
+
+```bash
+python "<Skill 目录>/scripts/imagegen.py" --diagnose
+```
+
+该模式不会调用 `/images/generations` 或重试图片生成；它会检查当前本地配置并可读取
+`/models`，然后输出新的 `DIAGNOSTIC_REPORT=` 行。报告不应包含或回显 API Key、图片描述、
+完整服务响应或完整下载地址。
 
 默认使用 `https://ai.weiloo.com/v1` 和 `gpt-image-2.5`。
 

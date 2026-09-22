@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import unittest
@@ -47,6 +48,17 @@ class FakeBinaryResponse:
 
     def read(self, _size: int | None = None) -> bytes:
         return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        return False
+
+
+class TimeoutResponse:
+    def read(self, _size: int | None = None) -> bytes:
+        raise socket.timeout("timed out")
 
     def __enter__(self):
         return self
@@ -287,6 +299,100 @@ class ImagegenTests(unittest.TestCase):
             f"IMAGE_PATH={json.dumps(str(generated_path), ensure_ascii=True)}\n",
         )
         self.assertTrue(stdout.getvalue().isascii())
+
+    def test_failed_generation_writes_a_redacted_diagnostic_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            failure = self.imagegen.ImagegenError(
+                "图片下载失败，请检查网络连接后重试。 test-api-key",
+                phase="image_download",
+                status_code=503,
+                response_mode="url",
+                remote_host="cdn.example.test",
+            )
+
+            with (
+                mock.patch.object(self.imagegen.Path, "cwd", return_value=workspace),
+                mock.patch.object(self.imagegen, "ensure_config"),
+                mock.patch.object(self.imagegen, "generate_image", side_effect=failure),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                exit_code = self.imagegen.main(["--prompt", "一张含有秘密的图片"])
+
+            line = stdout.getvalue().strip()
+            self.assertTrue(line.startswith("DIAGNOSTIC_REPORT="))
+            report_path = Path(json.loads(line.split("=", 1)[1]))
+            report = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("图片下载", report)
+        self.assertIn("HTTP 状态：503", report)
+        self.assertIn("响应方式：url", report)
+        self.assertIn("下载主机：cdn.example.test", report)
+        self.assertNotIn("一张含有秘密的图片", report)
+        self.assertNotIn("test-api-key", report)
+        self.assertTrue(line.isascii())
+
+    def test_response_read_timeout_is_tagged_as_generation_response(self) -> None:
+        config = self.imagegen.Config(
+            api_key="test-api-key",
+            base_url="https://ai.weiloo.com/v1",
+            model="gpt-image-2.5",
+        )
+
+        with mock.patch.object(
+            self.imagegen.urllib.request,
+            "urlopen",
+            return_value=TimeoutResponse(),
+        ):
+            with self.assertRaises(self.imagegen.ImagegenError) as ctx:
+                self.imagegen.generate_image(
+                    config,
+                    prompt="一张图片",
+                    size="1024x1024",
+                    output_path=Path("image.png"),
+                )
+
+        self.assertEqual(ctx.exception.phase, "generation_response")
+
+    def test_diagnose_checks_models_without_generating_an_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            config = self.imagegen.Config(
+                api_key="test-api-key",
+                base_url="https://ai.weiloo.com/v1",
+                model="gpt-image-2.5",
+            )
+            stdout = io.StringIO()
+            response = FakeJsonResponse({"data": [{"id": "gpt-image-2.5"}]})
+
+            with (
+                mock.patch.object(self.imagegen.Path, "cwd", return_value=workspace),
+                mock.patch.object(self.imagegen, "load_config", return_value=config),
+                mock.patch.object(self.imagegen.urllib.request, "urlopen", return_value=response) as urlopen,
+                mock.patch.object(self.imagegen, "generate_image") as generate_image,
+                contextlib.redirect_stdout(stdout),
+            ):
+                exit_code = self.imagegen.main(["--diagnose"])
+
+            line = stdout.getvalue().strip()
+            self.assertTrue(line.startswith("DIAGNOSTIC_REPORT="))
+            report_path = Path(json.loads(line.split("=", 1)[1]))
+            report = report_path.read_text(encoding="utf-8")
+            request = urlopen.call_args.args[0]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(request.full_url, "https://ai.weiloo.com/v1/models")
+        self.assertEqual(request.get_method(), "GET")
+        generate_image.assert_not_called()
+        self.assertIn("图片生成接口：未调用", report)
+        self.assertIn("模型接口：HTTP 200", report)
+        self.assertIn("当前模型：可用", report)
+        self.assertNotIn("test-api-key", report)
+        self.assertTrue(line.isascii())
 
 
 if __name__ == "__main__":
