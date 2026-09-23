@@ -148,7 +148,7 @@ def _run_setup(first_use: bool = False) -> None:
 
     if completed.returncode != 0:
         raise ConfigurationRequiredError(
-            "没有 API Key。请在 Codex 中输入 API Key 后重试。",
+            "没有 API Key。请重新输入 API Key 后重试。",
             phase="configuration",
         )
 
@@ -491,7 +491,7 @@ def _failure_report_markdown(error: ImagegenError, elapsed_ms: int) -> str:
             f"- 下载主机：{_safe_host(error.remote_host)}",
             "",
             "## 下一步",
-            "在 Codex 中输入 `$weiloo-image 为什么生成失败`，可运行当前环境的只读诊断。该诊断不会调用图片生成接口，也不会重试本次请求。",
+            "请让当前助手分析本次图片生成失败原因，可运行当前环境的只读诊断。该诊断不会调用图片生成接口，也不会重试本次请求。",
             "",
             "## 隐私",
             "本报告不记录 API Key、图片描述、完整服务响应、完整下载地址或环境变量。",
