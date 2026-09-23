@@ -178,6 +178,11 @@ class ImagegenTests(unittest.TestCase):
             request = urlopen.call_args.args[0]
             self.assertEqual(request.full_url, "https://ai.weiloo.com/v1/images/generations")
             self.assertEqual(
+                urlopen.call_args.kwargs["timeout"],
+                self.imagegen.IMAGE_REQUEST_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(self.imagegen.IMAGE_REQUEST_TIMEOUT_SECONDS, 300)
+            self.assertEqual(
                 json.loads(request.data.decode("utf-8")),
                 {
                     "model": "gpt-image-2.5",
@@ -217,6 +222,14 @@ class ImagegenTests(unittest.TestCase):
                 )
 
             self.assertEqual(urlopen.call_count, 2)
+            self.assertEqual(
+                urlopen.call_args_list[0].kwargs["timeout"],
+                self.imagegen.IMAGE_REQUEST_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(
+                urlopen.call_args_list[1].kwargs["timeout"],
+                self.imagegen.IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
+            )
             download_request = urlopen.call_args_list[1].args[0]
             self.assertEqual(download_request.get_header("Accept"), "image/*")
             self.assertEqual(
@@ -256,6 +269,10 @@ class ImagegenTests(unittest.TestCase):
             content_type = request.get_header("Content-type")
             body = request.data
             self.assertEqual(request.full_url, "https://ai.weiloo.com/v1/images/edits")
+            self.assertEqual(
+                urlopen.call_args.kwargs["timeout"],
+                self.imagegen.IMAGE_REQUEST_TIMEOUT_SECONDS,
+            )
             self.assertTrue(content_type.startswith("multipart/form-data; boundary="))
             self.assertEqual(body.count(b'name="image"'), 3)
             self.assertLess(body.index(b'filename="image-1.png"'), body.index(b'filename="image-2.jpg"'))
@@ -429,7 +446,7 @@ class ImagegenTests(unittest.TestCase):
         generate_image.assert_not_called()
         self.assertTrue(stdout.getvalue().startswith("IMAGE_PATH="))
 
-    def test_edit_failure_submits_once_and_writes_a_redacted_report(self) -> None:
+    def test_edit_gateway_timeout_is_not_retried_and_reports_an_uncertain_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir)
             source = self._write_edit_image(workspace, "private-source.png", "png")
@@ -437,8 +454,8 @@ class ImagegenTests(unittest.TestCase):
             stderr = io.StringIO()
             http_error = urllib.error.HTTPError(
                 "https://ai.weiloo.com/v1/images/edits",
-                429,
-                "Too Many Requests",
+                504,
+                "Gateway Timeout",
                 {},
                 io.BytesIO(b'{"error":"do not show this"}'),
             )
@@ -461,11 +478,43 @@ class ImagegenTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(urlopen.call_count, 1)
         self.assertIn("图片编辑请求", report)
-        self.assertIn("HTTP 状态：429", report)
+        self.assertIn("HTTP 状态：504", report)
+        self.assertIn("本地 HTTP 等待参数：300 秒", report)
+        self.assertIn("不是本地等待参数触发", report)
+        self.assertIn("结果状态：不确定", report)
+        self.assertIn("Weiloo 服务后台确认", report)
         self.assertNotIn("不要泄露这个提示词。", report)
         self.assertNotIn(str(source), report)
         self.assertNotIn("test-api-key", report)
         self.assertNotIn("do not show this", stderr.getvalue())
+        self.assertIn("网关超时", stderr.getvalue())
+
+    def test_local_request_timeout_is_distinguished_from_gateway_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "image.png"
+
+            with mock.patch.object(
+                self.imagegen.urllib.request,
+                "urlopen",
+                side_effect=socket.timeout("timed out"),
+            ) as urlopen:
+                with self.assertRaises(self.imagegen.ImagegenError) as ctx:
+                    self.imagegen.generate_image(
+                        self._config(),
+                        prompt="一张图片",
+                        size="1024x1024",
+                        output_path=output_path,
+                    )
+
+        error = ctx.exception
+        report = self.imagegen._failure_report_markdown(error, 300000)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 300)
+        self.assertIsNone(error.status_code)
+        self.assertTrue(error.outcome_uncertain)
+        self.assertIn("本地等待图片服务超过 5 分钟", str(error))
+        self.assertIn("超时判断：本地未在等待参数内收完", report)
+        self.assertNotIn("504 判断", report)
+
 
     def test_diagnose_rejects_image_arguments_without_network_access(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -500,6 +549,7 @@ class ImagegenTests(unittest.TestCase):
             "图片服务拒绝该请求，请检查账户权限或稍后重试。",
         )
         self.assertEqual(self.imagegen.friendly_error(429), "API 请求次数达到限制。")
+        self.assertEqual(self.imagegen.friendly_error(504), "图片服务响应超时，请稍后重试。")
         self.assertEqual(self.imagegen.friendly_error(None), "无法连接图片服务，请检查网络。")
 
     def test_url_download_uses_the_same_friendly_http_error(self) -> None:
@@ -515,6 +565,25 @@ class ImagegenTests(unittest.TestCase):
             with self.assertRaisesRegex(self.imagegen.ImagegenError, "图片服务拒绝") as ctx:
                 self.imagegen._download_image("https://images.example.test/result.png")
 
+        self.assertNotIn("do not show this", str(ctx.exception))
+
+    def test_download_gateway_timeout_does_not_claim_the_image_is_still_generating(self) -> None:
+        error = urllib.error.HTTPError(
+            "https://images.example.test/result.png",
+            504,
+            "Gateway Timeout",
+            {},
+            io.BytesIO(b'{"error":"do not show this"}'),
+        )
+
+        with mock.patch.object(self.imagegen.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaises(self.imagegen.ImagegenError) as ctx:
+                self.imagegen._download_image("https://images.example.test/result.png")
+
+        self.assertEqual(ctx.exception.status_code, 504)
+        self.assertFalse(ctx.exception.outcome_uncertain)
+        self.assertIn("图片服务响应超时", str(ctx.exception))
+        self.assertNotIn("仍在生成", str(ctx.exception))
         self.assertNotIn("do not show this", str(ctx.exception))
 
     def test_http_error_is_mapped_without_exposing_the_server_body(self) -> None:
