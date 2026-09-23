@@ -1,74 +1,45 @@
 ---
 name: weiloo-image
-description: 使用 Weiloo AI 图片 API 生成图片，或分析 Weiloo 图片生成失败。
+description: 使用 Weiloo AI 图片 API 生成或编辑图片，并分析 Weiloo 图片生成或编辑失败。
 ---
 
 # Weiloo Image
 
-支持自然语言触发。显式调用时使用当前宿主的写法：
+当用户要生成图片、创建图片、设计海报、换背景、保留主体改风格，或根据一张或多张附件修改图片时使用本 Skill。
+
+显式调用方式：
 
 ```text
-Codex：
-$weiloo-image 生成一张赛博朋克城市
-
-WorkBuddy（包括 workbuddy、workBuddy、WORKBUDDY）：
-/weiloo-image 生成一张赛博朋克城市
+Codex：$weiloo-image 一只宇航员猫
+WorkBuddy（包括 workbuddy、workBuddy、WORKBUDDY）：/weiloo-image 一只宇航员猫
 ```
 
-触发场景：
-
-- 生成图片
-- 创建图片
-- 海报设计
-- 图片编辑
-- 分析 Weiloo 图片生成失败
-
-执行本 Skill 目录中的 `scripts/imagegen.py` 生成图片。命令的工作目录保持为用户当前
-任务目录，不要切换到已安装的 Skill 目录：
+在用户当前任务目录执行本 Skill 内的脚本，不要切换到已安装 Skill 目录：
 
 ```bash
 python "<Skill 目录>/scripts/imagegen.py" --prompt "<用户图片描述>"
 ```
 
-普通生成时直接在前台执行一次脚本。默认图片保存到当前任务目录下的 `outputs/`。
-成功后读取并报告脚本输出的 `IMAGE_PATH=` 行；其值是 JSON 字符串。不要通过扫描目录
-推断图片路径。不要先读取源码、调用 `/models`、修改已安装 Skill 文件、启动后台进程
-或轮询 Python 进程。
+普通文生图不要额外探测 `/models` 或 `/images/edits`。脚本会把结果写到当前任务的 `outputs/`，成功后只读取并报告脚本输出的 `IMAGE_PATH=` JSON 路径；不要扫描目录推测输出文件。
 
-图片请求可能计费。生成失败时报告脚本的用户友好错误并停止；不要自动重试。只有用户
-明确同意后，才可以再次提交图片生成请求。成功后直接报告文件路径；除非用户要求，
-不要额外检查图片画面。
+## 图片编辑
 
-失败时，脚本会输出 `DIAGNOSTIC_REPORT=` 行。读取其 JSON 路径并将 Markdown 报告交付
-给用户，不要扫描目录或重复提交图片请求。
+只有宿主已明确提供可读取的本地附件绝对路径时，才可根据原图编辑。使用每张附件对应的 `--image` 参数，保持宿主给出的顺序：第一张默认是主体图，后续图片默认只作参考。用户指定不同角色时，把角色说明写进 prompt，但不要改变上传顺序。
 
-只有用户明确询问“为什么生成失败”，或使用当前宿主的显式调用方式时，才在当前任务目录
-运行：
-
-```text
-Codex：$weiloo-image 为什么生成失败
-WorkBuddy：/weiloo-image 为什么生成失败
+```bash
+python "<Skill 目录>/scripts/imagegen.py" --prompt "第一张图保留主体；第二张图只参考背景；第三张图只参考材质。" --image "<主体图本地路径>" --image "<背景参考图本地路径>" --image "<材质参考图本地路径>"
 ```
 
-然后执行：
+支持一到四张 PNG、JPEG 或 WebP 本地图片。不要扫描下载目录、临时目录或工作目录寻找附件，不要猜测路径，也不要接受远程 URL、mask 或批量编辑。当前任务没有明确可读路径时，如实说明无法以用户原图编辑；不要重新生成相似图片后声称已完成编辑。
+
+一次生成或编辑只在前台提交一次请求。失败时报告脚本的用户友好错误并停止，不要自动重试。失败输出中的 `DIAGNOSTIC_REPORT=` 是 JSON 路径；读取该 Markdown 报告交付给用户，不要扫描目录或再次提交请求。
+
+仅当用户明确询问“为什么生成失败”或显式调用失败分析时，运行：
 
 ```bash
 python "<Skill 目录>/scripts/imagegen.py" --diagnose
 ```
 
-该模式不会调用 `/images/generations` 或重试图片生成；它会检查当前本地配置并可读取
-`/models`，然后输出新的 `DIAGNOSTIC_REPORT=` 行。报告不应包含或回显 API Key、图片描述、
-完整服务响应或完整下载地址。
+诊断不会调用图片生成或图片编辑接口，也不会重试先前请求；它可检查本地配置和 `/models`。不要在对话、命令行输出或报告中回显 API Key、图片描述、完整输入路径、完整服务响应或完整下载地址。
 
-默认使用 `https://ai.weiloo.com/v1` 和 `gpt-image-2.5`。
-
-首次使用没有 API Key 时，提示：
-
-```text
-未检测到 API Key。
-请输入 API Key：
-```
-
-用户输入后自动保存到 `~/.codex/weiloo-image/config.json`，之后不再要求输入。
-收到 API Key 后，运行 `scripts/setup.py` 保存并继续原图片请求，不要回显 API Key。
-不要显示 API Key、Python traceback 或原始服务错误。
+首次使用没有 API Key 时，脚本会提示输入并保存到 `~/.codex/weiloo-image/config.json`。收到 API Key 后运行内置配置流程并继续原请求，不要回显密钥、显示 Python traceback 或原始服务错误。

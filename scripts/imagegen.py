@@ -15,6 +15,7 @@ import re
 import secrets
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,12 +35,18 @@ REQUEST_TIMEOUT_SECONDS: Final = 120
 DIAGNOSTIC_TIMEOUT_SECONDS: Final = 30
 MAX_JSON_RESPONSE_BYTES: Final = 5 * 1024 * 1024
 MAX_IMAGE_BYTES: Final = 50 * 1024 * 1024
+MAX_EDIT_IMAGES: Final = 4
+MAX_EDIT_IMAGE_BYTES: Final = 20 * 1024 * 1024
+MAX_EDIT_TOTAL_BYTES: Final = 40 * 1024 * 1024
 SIZE_PATTERN: Final = re.compile(r"^[1-9][0-9]{1,4}x[1-9][0-9]{1,4}$")
 PHASE_LABELS: Final = {
     "configuration": "配置读取",
     "input": "输入校验",
+    "image_input": "图片输入校验",
     "generation_request": "图片生成请求",
     "generation_response": "图片生成响应",
+    "edit_request": "图片编辑请求",
+    "edit_response": "图片编辑响应",
     "image_download": "图片下载",
     "local_write": "本地写入",
     "unknown": "未知阶段",
@@ -82,6 +89,15 @@ class ModelProbe:
 
     endpoint_status: str
     model_status: str
+
+
+@dataclass(frozen=True)
+class EditImage:
+    """A validated image that is safe to include in an edit multipart request."""
+
+    filename: str
+    content_type: str
+    content: bytes
 
 
 class FriendlyArgumentParser(argparse.ArgumentParser):
@@ -200,6 +216,173 @@ def build_generation_request(config: Config, prompt: str, size: str) -> urllib.r
     )
 
 
+def _image_format_from_signature(content: bytes) -> tuple[str, str] | None:
+    """Return the MIME type and safe extension for supported image bytes."""
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", "png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", "jpg"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    return None
+
+
+def load_edit_images(image_paths: list[str]) -> list[EditImage]:
+    """Read explicitly supplied local images without discovering files on disk."""
+    if not image_paths:
+        raise ImagegenError("请提供至少一张本地图片用于编辑。", phase="image_input")
+    if len(image_paths) > MAX_EDIT_IMAGES:
+        raise ImagegenError(
+            f"一次最多可使用 {MAX_EDIT_IMAGES} 张图片进行编辑。",
+            phase="image_input",
+        )
+
+    total_size = 0
+    images: list[EditImage] = []
+    for index, raw_path in enumerate(image_paths, start=1):
+        try:
+            path = Path(raw_path).expanduser()
+        except (TypeError, ValueError) as exc:
+            raise ImagegenError(
+                "未找到可读取的本地图片，请重新选择附件后重试。",
+                phase="image_input",
+            ) from exc
+
+        if not path.is_absolute():
+            raise ImagegenError(
+                "请提供宿主给出的本地图片绝对路径。",
+                phase="image_input",
+            )
+        try:
+            file_status = path.lstat()
+        except OSError as exc:
+            raise ImagegenError(
+                "未找到可读取的本地图片，请重新选择附件后重试。",
+                phase="image_input",
+            ) from exc
+
+        if not stat.S_ISREG(file_status.st_mode):
+            raise ImagegenError("图片输入必须是一个普通本地文件。", phase="image_input")
+
+        try:
+            is_readable = os.access(path, os.R_OK)
+        except OSError as exc:
+            raise ImagegenError(
+                "图片文件无法读取，请重新选择附件后重试。",
+                phase="image_input",
+            ) from exc
+
+        if not is_readable:
+            raise ImagegenError("图片文件无法读取，请重新选择附件后重试。", phase="image_input")
+        file_size = file_status.st_size
+        if file_size > MAX_EDIT_IMAGE_BYTES:
+            raise ImagegenError(
+                "单张输入图片不能超过 20 MiB。",
+                phase="image_input",
+            )
+        if total_size + file_size > MAX_EDIT_TOTAL_BYTES:
+            raise ImagegenError(
+                "输入图片总大小不能超过 40 MiB。",
+                phase="image_input",
+            )
+
+        try:
+            with path.open("rb") as handle:
+                content = handle.read(MAX_EDIT_IMAGE_BYTES + 1)
+        except OSError as exc:
+            raise ImagegenError(
+                "图片文件无法读取，请重新选择附件后重试。",
+                phase="image_input",
+            ) from exc
+
+        if len(content) > MAX_EDIT_IMAGE_BYTES:
+            raise ImagegenError(
+                "单张输入图片不能超过 20 MiB。",
+                phase="image_input",
+            )
+        total_size += len(content)
+        if total_size > MAX_EDIT_TOTAL_BYTES:
+            raise ImagegenError(
+                "输入图片总大小不能超过 40 MiB。",
+                phase="image_input",
+            )
+
+        image_format = _image_format_from_signature(content)
+        if image_format is None:
+            raise ImagegenError(
+                "不支持的图片格式。请使用 PNG、JPEG 或 WebP 图片。",
+                phase="image_input",
+            )
+        content_type, extension = image_format
+        # Never place the supplied path or filename into a multipart header.
+        images.append(
+            EditImage(
+                filename=f"image-{index}.{extension}",
+                content_type=content_type,
+                content=content,
+            )
+        )
+    return images
+
+
+def _append_multipart_text_part(body: bytearray, boundary: str, name: str, value: str) -> None:
+    body.extend(f"--{boundary}\r\n".encode("ascii"))
+    body.extend(
+        f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("ascii")
+    )
+    body.extend(value.encode("utf-8"))
+    body.extend(b"\r\n")
+
+
+def _encode_edit_multipart(
+    config: Config,
+    prompt: str,
+    size: str,
+    images: list[EditImage],
+    boundary: str,
+) -> bytes:
+    body = bytearray()
+    for name, value in (("model", config.model), ("prompt", prompt), ("size", size)):
+        _append_multipart_text_part(body, boundary, name, value)
+
+    for image in images:
+        body.extend(f"--{boundary}\r\n".encode("ascii"))
+        body.extend(
+            (
+                'Content-Disposition: form-data; name="image"; '
+                f'filename="{image.filename}"\r\n'
+            ).encode("ascii")
+        )
+        body.extend(f"Content-Type: {image.content_type}\r\n\r\n".encode("ascii"))
+        body.extend(image.content)
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}--\r\n".encode("ascii"))
+    return bytes(body)
+
+
+def build_edit_request(
+    config: Config,
+    prompt: str,
+    size: str,
+    images: list[EditImage],
+) -> urllib.request.Request:
+    """Build the minimal OpenAI-compatible multipart request for image edits."""
+    if not images:
+        raise ImagegenError("请提供至少一张本地图片用于编辑。", phase="image_input")
+    boundary = f"----WeilooImageSkill{secrets.token_hex(16)}"
+    return urllib.request.Request(
+        f"{config.base_url}/images/edits",
+        data=_encode_edit_multipart(config, prompt, size, images, boundary),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {config.api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": USER_AGENT,
+        },
+    )
+
+
 def _read_limited(
     response: Any,
     limit: int,
@@ -236,14 +419,14 @@ def _read_json_response(response: Any, *, phase: str = "generation_response") ->
     return payload
 
 
-def _decode_base64_image(value: str) -> bytes:
+def _decode_base64_image(value: str, *, phase: str = "generation_response") -> bytes:
     encoded = value.strip()
     if encoded.startswith("data:"):
         metadata, separator, encoded = encoded.partition(",")
         if not separator or ";base64" not in metadata.lower():
             raise ImagegenError(
                 "服务返回的图片数据无效，请稍后重试。",
-                phase="generation_response",
+                phase=phase,
                 response_mode="b64_json",
             )
     try:
@@ -251,24 +434,24 @@ def _decode_base64_image(value: str) -> bytes:
     except (binascii.Error, ValueError) as exc:
         raise ImagegenError(
             "服务返回的图片数据无效，请稍后重试。",
-            phase="generation_response",
+            phase=phase,
             response_mode="b64_json",
         ) from exc
     if not image or len(image) > MAX_IMAGE_BYTES:
         raise ImagegenError(
             "服务返回的图片数据无效，请稍后重试。",
-            phase="generation_response",
+            phase=phase,
             response_mode="b64_json",
         )
     return image
 
 
-def _download_image(url: str) -> bytes:
+def _download_image(url: str, *, response_phase: str = "generation_response") -> bytes:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ImagegenError(
             "服务返回的图片地址无效，请稍后重试。",
-            phase="generation_response",
+            phase=response_phase,
             response_mode="url",
         )
     remote_host = parsed.hostname
@@ -314,21 +497,25 @@ def _download_image(url: str) -> bytes:
     return image
 
 
-def image_bytes_from_response(payload: dict[str, Any]) -> bytes:
+def image_bytes_from_response(
+    payload: dict[str, Any],
+    *,
+    response_phase: str = "generation_response",
+) -> bytes:
     data = payload.get("data")
     if not isinstance(data, list) or not data or not isinstance(data[0], dict):
-        raise ImagegenError("服务没有返回图片，请稍后重试。", phase="generation_response")
+        raise ImagegenError("服务没有返回图片，请稍后重试。", phase=response_phase)
 
     item = data[0]
     base64_image = item.get("b64_json")
     if isinstance(base64_image, str) and base64_image.strip():
-        return _decode_base64_image(base64_image)
+        return _decode_base64_image(base64_image, phase=response_phase)
 
     image_url = item.get("url")
     if isinstance(image_url, str) and image_url.strip():
-        return _download_image(image_url.strip())
+        return _download_image(image_url.strip(), response_phase=response_phase)
 
-    raise ImagegenError("服务没有返回图片，请稍后重试。", phase="generation_response")
+    raise ImagegenError("服务没有返回图片，请稍后重试。", phase=response_phase)
 
 
 def _write_new_file_atomically(output_path: Path, image: bytes) -> None:
@@ -397,30 +584,59 @@ def _write_new_file_atomically(output_path: Path, image: bytes) -> None:
             pass
 
 
-def generate_image(config: Config, prompt: str, size: str, output_path: Path) -> Path:
-    """Request one image and publish the first returned item to ``output_path``."""
-    request = build_generation_request(config, prompt, size)
+def _submit_image_request(
+    request: urllib.request.Request,
+    *,
+    request_phase: str,
+    response_phase: str,
+) -> dict[str, Any]:
     try:
         response = urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS)
     except urllib.error.HTTPError as exc:
         raise ImagegenError(
             friendly_error(exc.code),
-            phase="generation_request",
+            phase=request_phase,
             status_code=exc.code,
         ) from exc
     except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
-        raise ImagegenError(friendly_error(None), phase="generation_request") from exc
+        raise ImagegenError(friendly_error(None), phase=request_phase) from exc
 
     try:
         with response:
-            response_payload = _read_json_response(response)
+            return _read_json_response(response, phase=response_phase)
     except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
         raise ImagegenError(
             "图片服务响应读取失败，请检查网络连接后重试。",
-            phase="generation_response",
+            phase=response_phase,
         ) from exc
 
+
+def generate_image(config: Config, prompt: str, size: str, output_path: Path) -> Path:
+    """Request one generated image and publish it to ``output_path``."""
+    response_payload = _submit_image_request(
+        build_generation_request(config, prompt, size),
+        request_phase="generation_request",
+        response_phase="generation_response",
+    )
     image = image_bytes_from_response(response_payload)
+    _write_new_file_atomically(output_path, image)
+    return output_path
+
+
+def edit_image(
+    config: Config,
+    prompt: str,
+    size: str,
+    images: list[EditImage],
+    output_path: Path,
+) -> Path:
+    """Edit with one to four validated local images and publish the result."""
+    response_payload = _submit_image_request(
+        build_edit_request(config, prompt, size, images),
+        request_phase="edit_request",
+        response_phase="edit_response",
+    )
+    image = image_bytes_from_response(response_payload, response_phase="edit_response")
     _write_new_file_atomically(output_path, image)
     return output_path
 
@@ -580,11 +796,18 @@ def run_environment_diagnostic() -> Path:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = FriendlyArgumentParser(description="使用 Weiloo AI 生成一张图片。")
+    parser = FriendlyArgumentParser(description="使用 Weiloo AI 生成或编辑一张图片。")
     parser.add_argument("prompt", nargs="?", help="图片描述")
     parser.add_argument("-p", "--prompt", dest="prompt_option", help="图片描述")
     parser.add_argument("--size", default=DEFAULT_SIZE, help="图片尺寸，默认 1024x1024")
     parser.add_argument("-o", "--output", help="图片保存路径")
+    parser.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        metavar="本地图片路径",
+        help="用于编辑的本地图片；可重复使用，最多 4 张",
+    )
     parser.add_argument(
         "--configure",
         action="store_true",
@@ -614,11 +837,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.configure and args.diagnose:
             raise ImagegenError("配置与诊断不能同时运行。", phase="input")
         if args.configure:
+            if args.prompt or args.prompt_option or args.output or args.image:
+                raise ImagegenError("配置模式不接受图片描述、图片或输出路径。", phase="input")
             _run_setup()
             return 0
         if args.diagnose:
-            if args.prompt or args.prompt_option or args.output:
-                raise ImagegenError("诊断模式不接受图片描述或输出路径。", phase="input")
+            if args.prompt or args.prompt_option or args.output or args.image:
+                raise ImagegenError("诊断模式不接受图片描述、图片或输出路径。", phase="input")
             report_path = run_environment_diagnostic()
             print(_artifact_path_line("DIAGNOSTIC_REPORT", report_path))
             return 0
@@ -626,7 +851,13 @@ def main(argv: list[str] | None = None) -> int:
         prompt = _resolve_prompt(args)
         size = validate_size(args.size)
         output_path = Path(args.output).expanduser() if args.output else default_output_path(prompt)
-        generated = generate_image(ensure_config(), prompt, size, output_path)
+        images = load_edit_images(args.image) if args.image else []
+        config = ensure_config()
+        generated = (
+            edit_image(config, prompt, size, images, output_path)
+            if images
+            else generate_image(config, prompt, size, output_path)
+        )
     except ImagegenError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         report_path = write_failure_report(exc, int((time.monotonic() - started_at) * 1000))
@@ -636,6 +867,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("已取消。", file=sys.stderr)
         return 130
+    except Exception:
+        error = ImagegenError("图片处理失败，请稍后重试。", phase="unknown")
+        print(f"错误：{error}", file=sys.stderr)
+        report_path = write_failure_report(error, int((time.monotonic() - started_at) * 1000))
+        if report_path is not None:
+            print(_artifact_path_line("DIAGNOSTIC_REPORT", report_path))
+        return 1
 
     # Keep the success record ASCII-only so Codex can recover it through
     # terminals whose display encoding does not support Chinese text.
