@@ -5,13 +5,15 @@ description: 使用 Weiloo AI 图片 API 生成图片，或分析 Weiloo 图片�
 
 # Weiloo Image
 
-用户可以显式输入 `$weiloo-image` 调用此 Skill，例如：
+支持自然语言触发。显式调用时使用当前宿主的写法：
 
 ```text
+Codex：
 $weiloo-image 生成一张赛博朋克城市
-```
 
-也支持自然语言触发。
+WorkBuddy（包括 workbuddy、workBuddy、WORKBUDDY）：
+/weiloo-image 生成一张赛博朋克城市
+```
 
 触发场景：
 
@@ -40,8 +42,15 @@ python "<Skill 目录>/scripts/imagegen.py" --prompt "<用户图片描述>"
 失败时，脚本会输出 `DIAGNOSTIC_REPORT=` 行。读取其 JSON 路径并将 Markdown 报告交付
 给用户，不要扫描目录或重复提交图片请求。
 
-只有用户明确询问“为什么生成失败”或显式输入 `$weiloo-image 为什么生成失败` 时，才在
-当前任务目录运行：
+只有用户明确询问“为什么生成失败”，或使用当前宿主的显式调用方式时，才在当前任务目录
+运行：
+
+```text
+Codex：$weiloo-image 为什么生成失败
+WorkBuddy：/weiloo-image 为什么生成失败
+```
+
+然后执行：
 
 ```bash
 python "<Skill 目录>/scripts/imagegen.py" --diagnose
