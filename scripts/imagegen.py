@@ -31,7 +31,8 @@ DEFAULT_BASE_URL: Final = "https://ai.weiloo.com/v1"
 DEFAULT_MODEL: Final = "gpt-image-2.5"
 DEFAULT_SIZE: Final = "1024x1024"
 USER_AGENT: Final = "Codex-Weiloo-Image-Skill/1.0"
-REQUEST_TIMEOUT_SECONDS: Final = 120
+IMAGE_REQUEST_TIMEOUT_SECONDS: Final = 5 * 60
+IMAGE_DOWNLOAD_TIMEOUT_SECONDS: Final = 120
 DIAGNOSTIC_TIMEOUT_SECONDS: Final = 30
 MAX_JSON_RESPONSE_BYTES: Final = 5 * 1024 * 1024
 MAX_IMAGE_BYTES: Final = 50 * 1024 * 1024
@@ -64,12 +65,14 @@ class ImagegenError(Exception):
         status_code: int | None = None,
         response_mode: str | None = None,
         remote_host: str | None = None,
+        outcome_uncertain: bool = False,
     ) -> None:
         super().__init__(message)
         self.phase = phase
         self.status_code = status_code
         self.response_mode = response_mode
         self.remote_host = remote_host
+        self.outcome_uncertain = outcome_uncertain
 
 
 class ConfigurationRequiredError(ImagegenError):
@@ -186,9 +189,37 @@ def friendly_error(status_code: int | None) -> str:
         return "图片服务拒绝该请求，请检查账户权限或稍后重试。"
     if status_code == 429:
         return "API 请求次数达到限制。"
+    if status_code == 504:
+        return "图片服务响应超时，请稍后重试。"
     if status_code is None:
         return "无法连接图片服务，请检查网络。"
     return f"图片生成失败（服务返回 {status_code}）。请稍后再试。"
+
+
+def _image_request_error(status_code: int) -> str:
+    """Explain gateway timeouts without mistaking them for local timeouts."""
+    if status_code == 504:
+        return (
+            "图片服务网关超时。服务端可能仍在生成或已完成，"
+            "请先在服务后台确认结果；不要立即重试。"
+        )
+    return friendly_error(status_code)
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return True
+    return isinstance(error, urllib.error.URLError) and isinstance(
+        error.reason,
+        (TimeoutError, socket.timeout),
+    )
+
+
+def _local_request_timeout_message() -> str:
+    return (
+        f"本地等待图片服务超过 {IMAGE_REQUEST_TIMEOUT_SECONDS // 60} 分钟。"
+        "服务端结果可能仍在处理中，请先在服务后台确认；不要立即重试。"
+    )
 
 
 def validate_size(value: str) -> str:
@@ -463,7 +494,7 @@ def _download_image(url: str, *, response_phase: str = "generation_response") ->
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=IMAGE_DOWNLOAD_TIMEOUT_SECONDS) as response:
             image = _read_limited(
                 response,
                 MAX_IMAGE_BYTES,
@@ -591,23 +622,33 @@ def _submit_image_request(
     response_phase: str,
 ) -> dict[str, Any]:
     try:
-        response = urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS)
+        response = urllib.request.urlopen(request, timeout=IMAGE_REQUEST_TIMEOUT_SECONDS)
     except urllib.error.HTTPError as exc:
         raise ImagegenError(
-            friendly_error(exc.code),
+            _image_request_error(exc.code),
             phase=request_phase,
             status_code=exc.code,
+            outcome_uncertain=exc.code == 504,
         ) from exc
     except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
-        raise ImagegenError(friendly_error(None), phase=request_phase) from exc
+        timed_out = _is_timeout_error(exc)
+        raise ImagegenError(
+            _local_request_timeout_message() if timed_out else friendly_error(None),
+            phase=request_phase,
+            outcome_uncertain=timed_out,
+        ) from exc
 
     try:
         with response:
             return _read_json_response(response, phase=response_phase)
     except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
+        timed_out = _is_timeout_error(exc)
         raise ImagegenError(
-            "图片服务响应读取失败，请检查网络连接后重试。",
+            _local_request_timeout_message()
+            if timed_out
+            else "图片服务响应读取失败，请检查网络连接后重试。",
             phase=response_phase,
+            outcome_uncertain=timed_out,
         ) from exc
 
 
@@ -688,6 +729,33 @@ def _safe_host(value: str | None) -> str:
     return normalized or "未获取"
 
 
+def _failure_context_lines(error: ImagegenError) -> list[str]:
+    if error.status_code == 504 and error.outcome_uncertain:
+        return [
+            f"- 本地 HTTP 等待参数：{IMAGE_REQUEST_TIMEOUT_SECONDS} 秒",
+            "- 504 判断：服务端或中间网关返回了 HTTP 504，不是本地等待参数触发。",
+            "- 结果状态：不确定，服务端任务可能仍在运行或已完成。",
+        ]
+    if error.outcome_uncertain:
+        return [
+            f"- 本地 HTTP 等待参数：{IMAGE_REQUEST_TIMEOUT_SECONDS} 秒",
+            "- 超时判断：本地未在等待参数内收完服务响应，不能确认服务端是否完成。",
+            "- 结果状态：不确定，服务端任务可能仍在运行或已完成。",
+        ]
+    return []
+
+
+def _failure_next_step_lines(error: ImagegenError) -> list[str]:
+    if error.outcome_uncertain:
+        return [
+            "- 请先在 Weiloo 服务后台确认任务或已生成图片。",
+            "- 不要立即重新提交相同请求，以免重复扣费；确认后台没有结果后，再由用户决定是否重试。",
+        ]
+    return [
+        "请让当前助手分析本次图片生成失败原因，可运行当前环境的只读诊断。该诊断不会调用图片生成接口，也不会重试本次请求。"
+    ]
+
+
 def _failure_report_markdown(error: ImagegenError, elapsed_ms: int) -> str:
     phase = PHASE_LABELS.get(error.phase, PHASE_LABELS["unknown"])
     status_code = str(error.status_code) if error.status_code is not None else "未获取"
@@ -705,9 +773,10 @@ def _failure_report_markdown(error: ImagegenError, elapsed_ms: int) -> str:
             f"- HTTP 状态：{status_code}",
             f"- 响应方式：{response_mode}",
             f"- 下载主机：{_safe_host(error.remote_host)}",
+            *_failure_context_lines(error),
             "",
             "## 下一步",
-            "请让当前助手分析本次图片生成失败原因，可运行当前环境的只读诊断。该诊断不会调用图片生成接口，也不会重试本次请求。",
+            *_failure_next_step_lines(error),
             "",
             "## 隐私",
             "本报告不记录 API Key、图片描述、完整服务响应、完整下载地址或环境变量。",
